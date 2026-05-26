@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent_utils"
+version = "0.0.1"
+authors = [
+  { name="Simpidbit Isaiah", email="simpidbit@gmail.com" },
+]
+description = "Utilities for AI agent development."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-magic",
+    "markdown",
+    "beautifulsoup4",
+    "python-dotenv",
+    "mcp",
+    "openai",
+    "simpidlog"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Simpidbit/agent_utils.git"
+
+[tool.setuptools.packages.find]
+where = ["src"]
