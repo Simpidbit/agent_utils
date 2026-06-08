@@ -4,11 +4,10 @@ import json
 import base64
 import typing
 import uuid
+import inspect
 from magic import from_buffer as analyse_mime_from_bin
 import mimetypes
 import httpx
-
-import traceback
 
 from typing import Annotated, Literal
 from markdown import markdown
@@ -18,7 +17,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from openai import OpenAIError
-from openai import AsyncStream
 
 import simpidlog
 
@@ -27,23 +25,55 @@ load_dotenv(Path(__file__).with_name(".env"))
 _ERROR_PREFIX = '@Simpidbit/agent_utils/llmapi.py\n'
 
 _FILE_PATHS_ANNOTATION = Annotated[
-    list[str | Path] | None,
-    'File\'s full path'
+    list[str | os.PathLike[str]] | tuple[str | os.PathLike[str], ...] | None,
+    'Image file full path'
 ]
 
 _FILE_BINS_ANNOTATION = Annotated[
-    dict[str | Path, bytes] | list[bytes] | None,
-    'dict[str | Path, bytes]: key is the full file path，value is the binary bytes data of the file.\n'
-    'list[bytes]: List of bytes, while filename from python-magic guessing.'
+    dict[str | os.PathLike[str], bytes] | list[bytes] | None,
+    'dict[str | Path, bytes]: key is the image file path/name, value is the binary image bytes.\n'
+    'list[bytes]: List of image bytes, while filename from python-magic guessing.'
 ]
 
 _NAME_MIME_B64_ANNOTATION = list[
     tuple[
-        Annotated[str, 'File name'],
-        Annotated[str, 'File MIME'],
-        Annotated[str, 'Base64 string encoded by UTF-8 of the file']
+        Annotated[str, 'Image name'],
+        Annotated[str, 'Image MIME'],
+        Annotated[str, 'Base64 string encoded by UTF-8 of the image']
     ]
 ]
+
+_ReasoningEffort = Literal['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+
+
+def _get_attr_or_key(value: object, key: str, default: object = None) -> object:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _extract_output_text_from_response_payload(response: object) -> str:
+    chunks: list[str] = []
+    output = _get_attr_or_key(response, 'output', [])
+
+    if not isinstance(output, list):
+        return ''
+
+    for item in output:
+        content = _get_attr_or_key(item, 'content', [])
+        if not isinstance(content, list):
+            continue
+
+        for content_item in content:
+            content_type = _get_attr_or_key(content_item, 'type')
+            if content_type not in ('output_text', 'text'):
+                continue
+
+            text = _get_attr_or_key(content_item, 'text', '')
+            if isinstance(text, str):
+                chunks.append(text)
+
+    return ''.join(chunks)
 
 class FileSizeExceededError(Exception):
     MAX_SIZE: Literal[52428800,] = 50 * 1024 * 1024
@@ -75,29 +105,44 @@ def _extract_text_from_raw_sse(raw: str) -> str:
         except json.JSONDecodeError:
             continue
 
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                delta = choice.get("delta") if isinstance(choice, dict) else None
+                message = choice.get("message") if isinstance(choice, dict) else None
+                if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                    chunks.append(delta["content"])
+                elif isinstance(message, dict) and isinstance(message.get("content"), str):
+                    chunks.append(message["content"])
+            continue
+
         typ = payload.get("type")
 
         if typ == "response.output_text.delta":
-            chunks.append(payload.get("delta", ""))
+            delta = payload.get("delta", "")
+            if isinstance(delta, str):
+                chunks.append(delta)
 
         elif typ == "response.output_text.done":
             # 有些实现会在 done 里带完整 text
             text = payload.get("text")
-            if text and not chunks:
+            if isinstance(text, str) and text and not chunks:
                 chunks.append(text)
 
-        elif typ in ("response.completed", "response.done"):
+        elif typ in ("response.completed", "response.done") and not chunks:
             # 兜底：从最终 response.output 里抽文本
-            resp = payload.get("response") or {}
-            for item in resp.get("output", []):
-                for c in item.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        chunks.append(c.get("text", ""))
+            chunks.append(_extract_output_text_from_response_payload(payload.get("response") or {}))
 
     return "".join(chunks).strip()
 
 class OnlineLLM:
     DEFAULT_MIME = 'application/octet-stream'
+    DEFAULT_TIMEOUT = httpx.Timeout(
+        connect = 60.0,
+        read = 1200.0,
+        write = 600.0,
+        pool = 60.0
+    )
 
     def __init__(
         self,
@@ -105,6 +150,7 @@ class OnlineLLM:
         api_key: str | None = None,
         model_id: str | None = None,
         client: AsyncOpenAI | None = None,
+        timeout: httpx.Timeout | float | None = None,
     ) -> None:
         self.base_url: str | None = base_url or os.getenv("BASEURL") or os.getenv("OPENAI_BASE_URL")
         self.api_key: str | None = api_key or os.getenv("APIKEY") or os.getenv("OPENAI_API_KEY")
@@ -134,12 +180,98 @@ class OnlineLLM:
 
         self.client: AsyncOpenAI = \
             client if client is not None else \
-            AsyncOpenAI(api_key = self.api_key, base_url = self.base_url, timeout = httpx.Timeout(
-                connect = 60.0,
-                read = 1200.0,
-                write = 600.0,
-                pool = 60.0
-            ))
+            AsyncOpenAI(
+                api_key = self.api_key,
+                base_url = self.base_url,
+                timeout = self.DEFAULT_TIMEOUT if timeout is None else timeout
+            )
+
+    async def close(self) -> None:
+        close = getattr(self.client, 'close', None)
+        if close is None:
+            return
+
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
+    async def __aenter__(self) -> typing.Self:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        await self.close()
+
+    def _require_model_id(self) -> str:
+        if self.model_id:
+            return self.model_id
+
+        errmsg = _ERROR_PREFIX + 'OnlineLLM._require_model_id(): MODEL is not configured.'
+        simpidlog.error(errmsg)
+        raise RuntimeError(errmsg)
+
+    def _raise_invalid_argument(self, message: str) -> typing.NoReturn:
+        errmsg = _ERROR_PREFIX + message
+        simpidlog.error(errmsg)
+        raise TypeError(errmsg)
+
+    def _normalize_file_paths(
+        self,
+        file_paths: _FILE_PATHS_ANNOTATION
+    ) -> list[Path]:
+        if file_paths is None:
+            return []
+
+        if isinstance(file_paths, (str, bytes)) or not isinstance(file_paths, (list, tuple)):
+            self._raise_invalid_argument(
+                'OnlineLLM._normalize_file_paths(): file_paths must be a list/tuple of str or Path, or None.'
+            )
+
+        paths: list[Path] = []
+        for index, path in enumerate(file_paths):
+            if not isinstance(path, (str, os.PathLike)):
+                self._raise_invalid_argument(
+                    'OnlineLLM._normalize_file_paths(): ' +
+                    f'file_paths[{index}] must be str or Path, got {type(path).__name__}.'
+                )
+            paths.append(Path(path))
+
+        return paths
+
+    def _validate_file_bin(self, name: str, file_bin: object) -> bytes:
+        if not isinstance(file_bin, bytes):
+            self._raise_invalid_argument(
+                f'OnlineLLM._validate_file_bin(): {name} must be bytes, got {type(file_bin).__name__}.'
+            )
+        return file_bin
+
+    def _has_uploads(
+        self,
+        file_paths: _FILE_PATHS_ANNOTATION,
+        file_bins: _FILE_BINS_ANNOTATION
+    ) -> bool:
+        if self._normalize_file_paths(file_paths):
+            return True
+
+        if file_bins is None:
+            return False
+
+        if isinstance(file_bins, dict):
+            for path, file_bin in file_bins.items():
+                if not isinstance(path, (str, os.PathLike)):
+                    self._raise_invalid_argument(
+                        'OnlineLLM._has_uploads(): file_bins keys must be str or Path.'
+                    )
+                self._validate_file_bin(f'file_bins[{path!r}]', file_bin)
+            return bool(file_bins)
+
+        if isinstance(file_bins, list):
+            for index, file_bin in enumerate(file_bins):
+                self._validate_file_bin(f'file_bins[{index}]', file_bin)
+            return bool(file_bins)
+
+        self._raise_invalid_argument(
+            'OnlineLLM._has_uploads(): file_bins must be dict[str | Path, bytes], list[bytes], or None.'
+        )
 
     def _raise_if_file_size_exceeded(self, total_size: int) -> None:
         if total_size > FileSizeExceededError.MAX_SIZE:
@@ -157,8 +289,24 @@ class OnlineLLM:
         return mime if isinstance(mime, str) and mime else self.DEFAULT_MIME
 
     def _mime_from_path(self, path: Path, file_bin: bytes) -> str:
-        mime, _ = mimetypes.guess_type(path)
-        return mime if mime else self._mime_from_bin(file_bin)
+        bin_mime = self._mime_from_bin(file_bin)
+        if bin_mime[:6] == 'image/':
+            return bin_mime
+
+        path_mime, _ = mimetypes.guess_type(path)
+        if bin_mime == self.DEFAULT_MIME and path_mime and path_mime[:6] == 'image/':
+            return path_mime
+
+        return bin_mime
+
+    def _raise_if_not_image_mime(self, name: str, mime: str) -> None:
+        if mime[:6] == 'image/':
+            return
+
+        errmsg = _ERROR_PREFIX + 'OnlineLLM._raise_if_not_image_mime(): ' + \
+                 f'Unsupported upload type for {name}: {mime}. Only image/* uploads are supported.'
+        simpidlog.error(errmsg)
+        raise ValueError(errmsg)
 
     def _build_name_mime_b64(
         self,
@@ -168,49 +316,98 @@ class OnlineLLM:
         name_mime_b64: _NAME_MIME_B64_ANNOTATION = []
         total_size: int = 0
 
-        if isinstance(file_paths, list):
-            for path in file_paths:
-                if isinstance(path, str):
-                    path = Path(path)
-                name = path.name
-                file_size = path.stat().st_size
-                total_size += file_size
-                self._raise_if_file_size_exceeded(total_size)
+        for path in self._normalize_file_paths(file_paths):
+            name = path.name
+            file_size = path.stat().st_size
+            total_size += file_size
+            self._raise_if_file_size_exceeded(total_size)
 
-                file_bin = path.read_bytes()
-                mime = self._mime_from_path(path, file_bin)
-                b64: str = base64.b64encode(file_bin).decode('utf-8')
-                name_mime_b64.append((name, mime, b64))
+            file_bin = path.read_bytes()
+            mime = self._mime_from_path(path, file_bin)
+            self._raise_if_not_image_mime(name, mime)
+            b64: str = base64.b64encode(file_bin).decode('utf-8')
+            name_mime_b64.append((name, mime, b64))
+
+        if file_bins is None:
+            return name_mime_b64, total_size
 
         if isinstance(file_bins, dict):
-            for path in file_bins.keys():
-                file_bin = file_bins[path]
-                if isinstance(path, str):
-                    path = Path(path)
+            for raw_path, raw_file_bin in file_bins.items():
+                if not isinstance(raw_path, (str, os.PathLike)):
+                    self._raise_invalid_argument(
+                        'OnlineLLM._build_name_mime_b64(): file_bins keys must be str or Path.'
+                    )
+
+                path = Path(raw_path)
+                file_bin = self._validate_file_bin(f'file_bins[{raw_path!r}]', raw_file_bin)
                 name = path.name
                 total_size += len(file_bin)
                 self._raise_if_file_size_exceeded(total_size)
 
-                mime = self._mime_from_bin(file_bin)
+                mime = self._mime_from_path(path, file_bin)
+                self._raise_if_not_image_mime(name, mime)
                 b64: str = base64.b64encode(file_bin).decode('utf-8')
 
                 name_mime_b64.append((name, mime, b64))
 
         elif isinstance(file_bins, list):
-            index = 1
-            for file_bin in file_bins:
+            for index, raw_file_bin in enumerate(file_bins, start = 1):
+                file_bin = self._validate_file_bin(f'file_bins[{index - 1}]', raw_file_bin)
                 total_size += len(file_bin)
                 self._raise_if_file_size_exceeded(total_size)
 
                 mime = self._mime_from_bin(file_bin)
                 extension = mimetypes.guess_extension(mime) or '.bin'
                 name = f'{index}{extension}'
+                self._raise_if_not_image_mime(name, mime)
                 b64: str = base64.b64encode(file_bin).decode('utf-8')
 
                 name_mime_b64.append((name, mime, b64))
-                index += 1
+        else:
+            self._raise_invalid_argument(
+                'OnlineLLM._build_name_mime_b64(): file_bins must be dict[str | Path, bytes], list[bytes], or None.'
+            )
 
         return name_mime_b64, total_size
+
+    def _user_message_indices(self, messages: list[dict]) -> list[int]:
+        indices: list[int] = []
+
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                self._raise_invalid_argument(
+                    f'OnlineLLM._user_message_indices(): messages[{index}] must be dict.'
+                )
+            if message.get('role') == 'user':
+                indices.append(index)
+
+        return indices
+
+    def _compatible_content_list(self, messages: list[dict], user_i: int) -> list:
+        content = messages[user_i].get('content')
+        if isinstance(content, list):
+            return content
+        if isinstance(content, str):
+            content_list = [{ 'type': 'text', 'text': content }]
+            messages[user_i]['content'] = content_list
+            return content_list
+
+        self._raise_invalid_argument(
+            'OnlineLLM._compatible_content_list(): user message content must be str or list.'
+        )
+
+    def _responses_content_list(self, messages: list[dict], user_i: int) -> list:
+        content = messages[user_i].get('content')
+        if isinstance(content, list):
+            return content
+        if isinstance(content, str):
+            content_list = [{ 'type': 'input_text', 'text': content }]
+            messages[user_i]['content'] = content_list
+            return content_list
+
+        self._raise_invalid_argument(
+            'OnlineLLM._responses_content_list(): user message content must be str or list.'
+        )
 
     def _insert_bins_to_messages_compatible(
         self,
@@ -218,7 +415,7 @@ class OnlineLLM:
         file_paths: _FILE_PATHS_ANNOTATION,
         file_bins: _FILE_BINS_ANNOTATION
     ) -> None:
-        if not (isinstance(file_paths, list) and file_paths) and file_bins is None:
+        if not self._has_uploads(file_paths, file_bins):
             return
 
         name_mime_b64, total_size = self._build_name_mime_b64(
@@ -233,40 +430,26 @@ class OnlineLLM:
             simpidlog.error(errmsg)
             raise FileSizeExceededError(errmsg)
 
-        # 判断原 messages 结构中是否存在多个 user
-        user_i: int | None = None
-        insert_mode: Literal['single_user', 'multi_users'] = 'single_user'
-        for i in range(len(messages)):
-            if messages[i]['role'] == 'user':
-                if user_i is None:
-                    user_i = i
-                    user_i = typing.cast(int, user_i)
-                else:
-                    insert_mode = 'multi_users'
-                    user_i = None
-                    break
+        user_indices = self._user_message_indices(messages)
+        if not user_indices:
+            self._raise_invalid_argument(
+                'OnlineLLM._insert_bins_to_messages_compatible(): messages must contain at least one user message.'
+            )
 
-        if insert_mode == 'single_user':
-            assert isinstance(user_i, int)
+        if len(user_indices) == 1:
+            content = self._compatible_content_list(messages, user_indices[0])
             for (name, mime, b64) in name_mime_b64:
-                if mime[:6] == 'image/':
-                    typing.cast(list, messages[user_i]['content']).append({
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:{mime};base64,{b64}'
-                        }
-                    })
-                else:
-                    typing.cast(list, messages[user_i]['content']).append({
-                        'type': 'file',
-                        'file': {
-                            'filename': name,
-                            'file_data': f'data:{mime};base64,{b64}'
-                        }
-                    })
+                self._raise_if_not_image_mime(name, mime)
+                content.append({
+                    'type': 'image_url',
+                    'image_url': {
+                        'url': f'data:{mime};base64,{b64}'
+                    }
+                })
         else:
             # messages 中有多个 user
-            assert user_i is None
+            for (name, mime, _) in name_mime_b64:
+                self._raise_if_not_image_mime(name, mime)
 
             messages.append({
                 'role': 'user',
@@ -275,13 +458,6 @@ class OnlineLLM:
                         'type': 'image_url',
                         'image_url': {
                             'url': f'data:{mime};base64,{b64}'
-                        }
-                    } if mime[:6] == 'image/' else
-                    {
-                        'type': 'file',
-                        'file': {
-                            'filename': name,
-                            'file_data': f'data:{mime};base64,{b64}'
                         }
                     }
                     for (name, mime, b64) in name_mime_b64
@@ -300,7 +476,7 @@ class OnlineLLM:
         if system_prompt is not None:
             messages = [{'role': 'system', 'content': system_prompt}]
 
-        if file_paths or file_bins:
+        if self._has_uploads(file_paths, file_bins):
             messages.append({
                 'role': 'user',
                 'content': [
@@ -318,33 +494,76 @@ class OnlineLLM:
 
         return messages
  
-    async def _parse_stream_response(self, stream: AsyncStream, request_id: str) -> str:
+    def _stream_text_delta(self, event: object) -> str:
+        event_type = _get_attr_or_key(event, 'type')
+        if event_type == 'response.output_text.delta':
+            delta = _get_attr_or_key(event, 'delta', '')
+            return delta if isinstance(delta, str) else ''
+
+        choices = _get_attr_or_key(event, 'choices', [])
+        if not isinstance(choices, list):
+            return ''
+
+        chunks: list[str] = []
+        for choice in choices:
+            delta = _get_attr_or_key(choice, 'delta')
+            content = _get_attr_or_key(delta, 'content', '')
+            if isinstance(content, str):
+                chunks.append(content)
+
+        return ''.join(chunks)
+
+    async def _parse_stream_response(self, stream: typing.AsyncIterable[object], request_id: str) -> str:
         text: str = ''
         index: int = 0
         async for event in stream:
-            match event.type:
-                case 'response.output_text.delta':
-                    text += event.delta
-                    index += 1
-                    simpidlog.debug(f'[{event.delta}]')
+            delta = self._stream_text_delta(event)
+            if delta:
+                text += delta
+                index += 1
+            elif not text and _get_attr_or_key(event, 'type') == 'response.output_text.done':
+                done_text = _get_attr_or_key(event, 'text', '')
+                if isinstance(done_text, str):
+                    text = done_text
             if index % 1000 == 0 and index != 0:
                 simpidlog.debug(_ERROR_PREFIX + f'OnlineLLM._parse_stream_response(): {request_id} has got {index} deltas...')
         simpidlog.debug(_ERROR_PREFIX + f'OnlineLLM._parse_stream_response(): ' + \
-                        f'{request_id} done with {index} deltas, {len(text)} bytes.\n' + \
-                        f'{text[:100]}...')
+                        f'{request_id} done with {index} deltas, {len(text)} bytes.')
         return text
+
+    def _content_from_compatible_response(self, response: object) -> str:
+        if isinstance(response, str):
+            return _extract_text_from_raw_sse(response) or response
+
+        choices = _get_attr_or_key(response, 'choices', [])
+        if not isinstance(choices, list) or not choices:
+            return ''
+
+        message = _get_attr_or_key(choices[0], 'message')
+        content = _get_attr_or_key(message, 'content', '')
+        return content if isinstance(content, str) else ''
+
+    def _content_from_responses_response(self, response: object) -> str:
+        if isinstance(response, str):
+            return _extract_text_from_raw_sse(response) or response
+
+        output_text = _get_attr_or_key(response, 'output_text', '')
+        if isinstance(output_text, str) and output_text:
+            return output_text
+
+        return _extract_output_text_from_response_payload(response)
 
     async def call_compatible(
         self,
         system_prompt: str | None,
         user_prompt: str,
         temperature: float,
-        effort: Literal['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
+        effort: _ReasoningEffort = 'medium',
         file_paths: _FILE_PATHS_ANNOTATION = None,
         file_bins: _FILE_BINS_ANNOTATION = None,
         stream: bool = False
      ) -> str:
-        assert self.model_id is not None
+        model_id = self._require_model_id()
         messages = self._build_msgs_compatible(
             system_prompt = system_prompt,
             user_prompt = user_prompt,
@@ -355,36 +574,31 @@ class OnlineLLM:
         try:
             request_id: str = str(uuid.uuid4())
             response = await self.client.chat.completions.create(
-                model = self.model_id,
+                model = model_id,
                 temperature = temperature,
                 messages = messages,
                 stream = stream,
                 reasoning_effort = effort
             )
         except OpenAIError as exc:
-            traceback.print_exc()
             errmsg = _ERROR_PREFIX + 'OnlineLLM.call_compatible(): Failed to call LLM API.\n' + str(exc)
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
-            print(str(exc))
             raise RuntimeError(errmsg) from exc
 
         if stream:
-            assert(isinstance(response, AsyncStream))
             content = await self._parse_stream_response(stream = response, request_id = request_id)
         else:
-            if isinstance(response, str):
-                content = response
-            else:
-                content = response.choices[0].message.content
+            content = self._content_from_compatible_response(response)
 
 
+        content = content.strip()
         if not content:
             errmsg = _ERROR_PREFIX + 'OnlineLLM.call_compatible(): LLM API calling returned empty content.'
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg)
-        return content.strip()
+        return content
 
     def _insert_bins_to_messages_responses(
         self,
@@ -392,7 +606,7 @@ class OnlineLLM:
         file_paths: _FILE_PATHS_ANNOTATION,
         file_bins: _FILE_BINS_ANNOTATION
     ) -> None:
-        if not (isinstance(file_paths, list) and file_paths) and file_bins is None:
+        if not self._has_uploads(file_paths, file_bins):
             return
 
         name_mime_b64, total_size = self._build_name_mime_b64(
@@ -407,25 +621,19 @@ class OnlineLLM:
             simpidlog.error(errmsg)
             raise FileSizeExceededError(errmsg)
 
-        user_i: int = 0
-        for i in range(len(messages)):
-            if messages[i]['role'] == 'user':
-                user_i = i
-                break
+        user_indices = self._user_message_indices(messages)
+        if not user_indices:
+            self._raise_invalid_argument(
+                'OnlineLLM._insert_bins_to_messages_responses(): messages must contain at least one user message.'
+            )
+        content = self._responses_content_list(messages, user_indices[0])
 
         for (name, mime, b64) in name_mime_b64:
-            content = typing.cast(list, messages[user_i]['content'])
-            if mime[:6] == 'image/':
-                content.append({
-                    'type': 'input_image',
-                    'image_url': f'data:{mime};base64,{b64}'
-                })
-            else:
-                content.append({
-                    'type': 'input_file',
-                    'filename': name,
-                    'file_data': f'data:{mime};base64,{b64}'
-                })
+            self._raise_if_not_image_mime(name, mime)
+            content.append({
+                'type': 'input_image',
+                'image_url': f'data:{mime};base64,{b64}'
+            })
 
     def _build_msgs_responses(
         self,
@@ -458,14 +666,14 @@ class OnlineLLM:
         system_prompt: str | None,
         user_prompt: str,
         temperature: float,
-        effort: Literal['none', 'low', 'medium', 'high', 'xhigh'] = 'medium',
+        effort: _ReasoningEffort = 'medium',
         web_search: Literal['none', 'low', 'medium', 'high'] = 'none',
         tools_required: bool = False,
         file_paths: _FILE_PATHS_ANNOTATION = None,
         file_bins: _FILE_BINS_ANNOTATION = None,
         stream: bool = False
      ) -> str:
-        assert self.model_id is not None
+        model_id = self._require_model_id()
         messages = self._build_msgs_responses(
             system_prompt = system_prompt,
             user_prompt = user_prompt,
@@ -477,7 +685,7 @@ class OnlineLLM:
             request_id: str = str(uuid.uuid4())
             if web_search == 'none':
                 response = await self.client.responses.create(
-                    model = self.model_id,
+                    model = model_id,
                     temperature = temperature,
                     input = messages,
                     stream = stream,
@@ -485,7 +693,7 @@ class OnlineLLM:
                 )
             else:
                 response = await self.client.responses.create(
-                    model = self.model_id,
+                    model = model_id,
                     temperature = temperature,
                     input = messages,
                     stream = stream,
@@ -499,33 +707,23 @@ class OnlineLLM:
 
 
         except OpenAIError as exc:
-            traceback.print_exc()
             errmsg = _ERROR_PREFIX + 'OnlineLLM.call_responses(): Failed to call LLM API.\n' + str(exc)
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg) from exc
 
         if stream:
-            assert(isinstance(response, AsyncStream))
             content = await self._parse_stream_response(stream = response, request_id = request_id)
         else:
-            if isinstance(response, str):
-                '''
-                errmsg = _ERROR_PREFIX + f'OnlineLLM.call_responses(): The type of response is str.'
-                simpidlog.error(errmsg)
-                simpidlog.error(_ERROR_PREFIX + response)
-                raise LLMResponseTypeError(errmsg)
-                '''
-                content = _extract_text_from_raw_sse(response)
-            else:
-                content = response.output_text
+            content = self._content_from_responses_response(response)
 
+        content = content.strip()
         if not content:
             errmsg = _ERROR_PREFIX + 'LLM API calling returned empty content.'
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg)
-        return content.strip()
+        return content
 
     def parse_json(
         self,
@@ -550,13 +748,13 @@ class OnlineLLM:
         try:
             value = json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            errmsg = _ERROR_PREFIX + f'Invalid JSON: {text}'
+            errmsg = _ERROR_PREFIX + f'Invalid JSON response. Original length: {len(text)} chars.'
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg) from exc
 
         if not isinstance(value, dict):
-            errmsg = _ERROR_PREFIX + f'Invalid JSON: {text}'
+            errmsg = _ERROR_PREFIX + f'Invalid JSON response: expected object, got {type(value).__name__}.'
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg)
@@ -575,15 +773,3 @@ class OnlineLLM:
         for code in codes:
             results.append(code.text)
         return results
-
-
-if __name__ == '__main__':
-    llm = OnlineLLM()
-
-    import asyncio
-    res = asyncio.run(llm.call_responses(
-        system_prompt = None,
-        user_prompt = 'How are you?',
-        temperature = 0.0
-    ))
-    print(res)

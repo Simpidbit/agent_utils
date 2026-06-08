@@ -18,7 +18,8 @@ dependencies = [
     "python-dotenv",
     "mcp",
     "openai",
-    "simpidlog"
+    "simpidlog",
+    "pymupdf"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
