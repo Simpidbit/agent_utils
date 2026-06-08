@@ -1,11 +1,15 @@
 import asyncio
 import uuid
-import pickle
 import json
 import copy
 from pathlib import Path
+import shutil
+import pickle
 
-from typing import Annotated
+import traceback
+
+from typing import Annotated, TypedDict
+from typeguard import typechecked
 
 import argparse
 
@@ -13,19 +17,59 @@ import fitz  # PyMuPDF
 import simpidlog
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from .llmapi import OnlineLLM
+from .llmapi import OnlineLLM, LLMResponseTypeError
 
 _LOG_PREFIX = '@Simpidbit/agent_utils/pdf2markdown.py\n'
+_TMPDIR = Path('/tmp')
 
 parser = argparse.ArgumentParser(description = 'PDF -> markdown\nBy Simpidbit Isaiah <simpidbit@gmail.com>.')
-parser.add_argument('cmd', choices = ['extract', 'print', 'export'], help = '命令')
+parser.add_argument('cmd', choices = ['extract', 'print', 'retry', 'export'], help = '命令')
 parser.add_argument('target', help = '目标文件路径，在 extract 下是 PDF 路径；在 print 或 export 下是 PKL 路径')
 parser.add_argument('--output', help = '输出文件位置')
 parser.add_argument('--workers', type = int, help = '将 PDF 文件提取为 PNG 图片的进程数', default = 20)
 parser.add_argument('--dpi', type = int, help = '将 PDF 文件提取为 PNG 图片的 DPI', default = 144)
-parser.add_argument('--logdir', help = '日志保存路径', default = '/tmp/agent_utils/pdf2markdown')
+parser.add_argument('--logdir', help = '日志保存路径', default = str(_TMPDIR / 'agent_utils/pdf2markdown'))
+parser.add_argument('--restore', help = 'PDFExtractor .pkl 恢复')
 args = parser.parse_args()
 
+
+class PDFPNG:
+    def __init__(self) -> None:
+        self.pngs: dict[int, bytes] = {}
+
+    @typechecked
+    def from_disk(self, pngdir: str | Path) -> None:
+        pngdir = Path(pngdir)
+        for pngfile in pngdir.iterdir():
+            if pngfile.is_file() and pngfile.suffix == '.png':
+                self.pngs[int(pngfile.stem)] = pngfile.read_bytes()
+
+    @typechecked
+    def from_pdf(self, pdfpath: str | Path) -> None:
+        pngdir_tmp: Path = _TMPDIR / str(uuid.uuid4())
+        _convert_pdf_to_pngs(pdfpath, pngdir_tmp, args.workers, args.dpi)
+        self.from_disk(pngdir_tmp)
+        shutil.rmtree(pngdir_tmp)
+
+    @typechecked
+    def __getitem__(self, id: int) -> bytes:
+        return self.pngs[id]
+
+    def __len__(self) -> int:
+        return len(self.pngs)
+
+
+class PDFContentEntry(TypedDict):
+    id: list[int]
+    title: str
+    page: int
+
+class PDFContent(TypedDict):
+    left: int
+    right: int
+    content: list[PDFContentEntry]
+
+@typechecked
 def _check_pdf_exists(pdfpath: str | Path) -> None:
     '''检查 PDF 是否存在'''
     if isinstance(pdfpath, str):
@@ -36,6 +80,7 @@ def _check_pdf_exists(pdfpath: str | Path) -> None:
         simpidlog.error(errmsg)
         raise FileNotFoundError(errmsg)
 
+@typechecked
 def _get_pdf_page_count(pdfpath: str | Path) -> int:
     '''获取 PDF 页数'''
     _check_pdf_exists(pdfpath = pdfpath)
@@ -46,6 +91,7 @@ def _get_pdf_page_count(pdfpath: str | Path) -> int:
 
     return page_count
 
+@typechecked
 def _render_one_page(
     args: tuple[
         Annotated[str, 'pdfpath'], 
@@ -71,6 +117,7 @@ def _render_one_page(
     finally:
         doc.close()
 
+@typechecked
 def _convert_pdf_to_pngs(
     pdfpath: str | Path,
     outputdir: str | Path,
@@ -109,16 +156,13 @@ def _convert_pdf_to_pngs(
             future.result()
     simpidlog.info(_LOG_PREFIX + f'PDF -> PNG 已完成')
 
+@typechecked
 async def _is_this_page_content(
-    pages_dir: str | Path,
+    pngs: PDFPNG,
     page_number: int
 ) -> bool:
     '''这一页是否是目录的一部分？'''
     llm = OnlineLLM()
-
-    pages_dir = Path(pages_dir)
-
-    page_png_path = pages_dir / f'{page_number:05d}.png'
 
     MAX_TRY: int = 5
 
@@ -130,33 +174,36 @@ async def _is_this_page_content(
                           '如果这一页并不包含目录的任何一部分，请回答 no 。',
             effort = 'medium',
             temperature = 0.0,
-            file_paths = [page_png_path]
+            file_bins = { f'{page_number:05d}.png': pngs[page_number] }
         )
         llm_response = llm_response.lower()
 
         if 'yes' in llm_response and 'no' not in llm_response:
+            await llm.client.close()
             return True
         if 'no' in llm_response and 'yes' not in llm_response:
+            await llm.client.close()
             return False
         else:
-            simpidlog.warning(_LOG_PREFIX + f'_is_this_page_content(): llm_response = \"{llm_response}\"')
+            simpidlog.debug(_LOG_PREFIX + f'_is_this_page_content(): llm_response = \"{llm_response}\"')
 
+    await llm.client.close()
     errmsg = _LOG_PREFIX + f'_is_this_page_content(): 尝试 {MAX_TRY} 次后，模型仍输出非法结果'
     simpidlog.error(errmsg)
     raise RuntimeError(errmsg)
 
+@typechecked
 async def _search_for_content_range(
-    pages_dir: str | Path,
-    page_count: int
+    pngs: PDFPNG
 ) -> tuple[int, int]:
     '''查找目录的开始和结束页面'''
 
-    assert page_count > 10
+    assert len(pngs) > 10
 
-    simpidlog.info(_LOG_PREFIX + '查找目录范围：第一轮查询开始')
+    simpidlog.info(_LOG_PREFIX + '_search_for_content_range(): Round 1.')
     results = await asyncio.gather(*[
-        _is_this_page_content(pages_dir, i)
-        for i in range(10, int(min(101, page_count / 2)), 10)
+        _is_this_page_content(pngs, i)
+        for i in range(10, int(min(101, len(pngs) / 2)), 10)
     ])
 
     # 找开始和结束区间
@@ -177,15 +224,16 @@ async def _search_for_content_range(
     end_left: int = start_end_sections[2]
     end_right: int = start_end_sections[3]
 
-    simpidlog.info(_LOG_PREFIX + '查找目录范围：第二轮查询开始')
+    simpidlog.info(_LOG_PREFIX + '_search_for_content_range(): Done.')
+    simpidlog.info(_LOG_PREFIX + '_search_for_content_range(): Round 2.')
     results = await asyncio.gather(*(
         [
-            _is_this_page_content(pages_dir, i)
+            _is_this_page_content(pngs, i)
             for i in range(start_left, start_right + 1)
         ]
             +
         [
-            _is_this_page_content(pages_dir, i)
+            _is_this_page_content(pngs, i)
             for i in range(end_left, end_right + 1)
         ]
     ))
@@ -206,15 +254,16 @@ async def _search_for_content_range(
             end_page = end_right - i + 1
             break
 
-    simpidlog.info(_LOG_PREFIX + f'查找目录范围：完毕，范围为 [{start_page}, {end_page}]')
+    simpidlog.info(_LOG_PREFIX + f'_search_for_content_range(): Done, [{start_page}, {end_page}].')
 
     return (start_page, end_page)
 
+@typechecked
 async def _extract_content(
-    pages_dir: str | Path,
+    pngs: PDFPNG,
     left:int, 
     right:int
-) -> dict:
+) -> PDFContent:
     '''目录信息提取器'''
     llm = OnlineLLM()
 
@@ -331,46 +380,40 @@ async def _extract_content(
                 user_prompt = '若干张目录图片已经上传给你，请你按照系统要求提取目录信息。',
                 temperature = 0.0,
                 effort = 'high',
-                file_paths = [
-                    Path(pages_dir) / f'{i:05d}.png'
+                file_bins = {
+                    f'{i:05d}.png': pngs[i]
                     for i in range(left, right + 1)
-                ]
+                }
             )
-            simpidlog.info(_LOG_PREFIX + f'_extract_content(): 模型返回目录信息')
-        except:
+            simpidlog.info(_LOG_PREFIX + f'_extract_content(): 模型成功返回目录信息')
+        except Exception as exc:
+            traceback.print_exc()
             simpidlog.info(_LOG_PREFIX + f'_extract_content(): 模型调用失败')
+            await llm.client.close()
+            llm = OnlineLLM()
             continue
+
+        await llm.client.close()
 
         try:
             res_dict: dict = llm.parse_json(llm_response)
         except:
             simpidlog.info(_LOG_PREFIX + f'_extract_content(): 模型输出目录信息 JSON 解析失败')
             continue
-        return res_dict
 
+        simpidlog.info(_LOG_PREFIX + f'_extract_content(): 目录解析完毕')
+        return {
+            'content': res_dict['content'],
+            'left': left,
+            'right': right
+        }
+
+    await llm.client.close()
     errmsg = _LOG_PREFIX + f'_extract_content(): 尝试 {MAX_TRY} 次后，模型仍无法输出合法结果'
     simpidlog.error(errmsg)
     raise RuntimeError(errmsg)
 
-class PDFPNG:
-    def __init__(self, pngdir: str | Path) -> None:
-        self.pngs: dict[int, bytes] = {}
 
-        pngdir = Path(pngdir)
-        for pngfile in pngdir.iterdir():
-            if pngfile.is_file() and pngfile.suffix == '.png':
-                self.pngs[int(pngfile.stem)] = pngfile.read_bytes()
-
-    def __getitem__(self, id: int) -> bytes:
-        return self.pngs[id]
-
-class PDFContent:
-    def __init__(self, pdfpath: str | Path) -> None:
-        self.pdfpath: str | Path = pdfpath
-        self.pngdir: Path = Path('/tmp') / str(uuid.uuid4())
-        _convert_pdf_to_pngs(self.pdfpath, self.pngdir, workers = args.workers, dpi = args.dpi)
-        self.left, self.right = asyncio.run(_search_for_content_range(self.pngdir, _get_pdf_page_count(self.pdfpath)))
-        self.content: dict = asyncio.run(_extract_content(self.pngdir, self.left, self.right))
 
 '''
 [
@@ -399,10 +442,12 @@ class PDFContent:
     ...
 ]
 '''
+
 class StructuredPDF:
     def __init__(self) -> None:
         self.data: list[dict] = []
 
+    @typechecked
     def is_index_exists(self, index: list[int]) -> bool:
         curlist: list[dict] = self.data
 
@@ -417,6 +462,7 @@ class StructuredPDF:
                 return False
         return True
 
+    @typechecked
     def __getitem__(self, index: list[int]) -> dict:
         curlist: list[dict] = self.data
         curdict: dict = {}
@@ -438,6 +484,7 @@ class StructuredPDF:
                 curlist = curlist[-1]['childs']
         return curdict
 
+    @typechecked
     def set(
         self, 
         ids: list[int],
@@ -457,6 +504,7 @@ class StructuredPDF:
         if text:
             curdict['text'] = text
 
+    @typechecked
     def next(
         self,
         ids: list[int]
@@ -487,17 +535,28 @@ class StructuredPDF:
     def get_print_text(self) -> str:
         return json.dumps(self.data, indent = 4, ensure_ascii = False, default = str)
 
+    @typechecked
+    def from_json(self, jsonpath: str | Path) -> None:
+        jsonpath = Path(jsonpath)
+        self.data = json.loads(jsonpath.read_text(encoding = 'utf-8'))
+
+@typechecked
 async def _extract_one_section(
-    pages_dir: str | Path,
+    pngs: PDFPNG,
     left_page: int,
     right_page: int,
     left_title: str,
-    right_title: str
+    right_title: str | None
 ) -> str:
     '''让模型提取一节内容'''
     llm = OnlineLLM()
 
     MAX_TRY: int = 5
+
+    if isinstance(right_title, str):
+        user_prompt = f'请你提取标题 {left_title} 下的内容：也就是从标题 {left_title} 到标题 {right_title} 之间的内容。'
+    else:
+        user_prompt = f'请你提取标题 {left_title} 下的内容。'
 
     for i in range(MAX_TRY):
         try:
@@ -530,55 +589,60 @@ async def _extract_one_section(
 
 ## 格式要求
 你需要直接输出你提取的结果，不要在你输出的提取结果外面再套一层 ```markdown 代码围栏，直接输出提取结果的 markdown 代码就行。
-用户让你提取某一标题下的内容，这个标题不管是几级标题，在你输出的提取结果中统统作为开头的一级标题，下面的标题层级以此递编。
+用户让你提取某一标题下的内容，这个标题不管是几级标题，在你输出的提取结果中统统作为开头的一级标题（而且不要把标题在原书中的编号写出来，只写标题本身，不带编号！），下面的标题层级以此递编。
 ''',
-                user_prompt = f'请你提取标题 {left_title} 下的内容：也就是从标题 {left_title} 到标题 {right_title} 之间的内容。',
+                user_prompt = user_prompt,
                 temperature = 0.1,
-                file_paths = [
-                    Path(pages_dir) / f'{i:05d}.png'
+                file_bins = {
+                    f'{i:05d}.png': pngs[i]
                     for i in range(left_page, right_page + 1)
-                ],
+                },
                 effort = 'xhigh'
             )
             simpidlog.debug(
                 _LOG_PREFIX +
                     f'_extract_one_section(): 标题 \"{left_title}\"（ page: {left_page}~{right_page} ）下的内容提取成功，{len(llm_response)} 字\n{llm_response[:50]}...'
             )
+            await llm.client.close()
             return llm_response
         except:
             simpidlog.warning(_LOG_PREFIX + f'_extract_one_section(): 标题 \"{left_title}\"（ page: {left_page}~{right_page} ）下的内容提取失败，重试第 {i + 1} 次...')
     
-    simpidlog.warning(_LOG_PREFIX + f'_extract_one_section(): 标题 \"{left_title}\"（ page: {left_page}~{right_page} ）下的内容提取失败，重试 {MAX_TRY} 后无果，已返回 \"UnknownError\"')
+    await llm.client.close()
+    simpidlog.warning(_LOG_PREFIX + f'_extract_one_section(): 标题 \"{left_title}\"（ page: {left_page}~{right_page} ）下的内容提取失败，重试 {MAX_TRY} 次后无果，已返回 \"UnknownError\"')
     return 'UnknownError'
 
 
-class PDF:
+class PDFExtractor:
+    @typechecked
     def __init__(
         self,
-        content: PDFContent,
+        pdfcontent: PDFContent,
+        pngs: PDFPNG,
         p1_page: int
     ) -> None:
-        self.content: list[dict] = content.content['content']
-        self.pages_dir: Path = content.pngdir
+        self.pdfcontent: PDFContent = pdfcontent
+        self.pngs = pngs
         self.p1_page: int = p1_page
         self.data: StructuredPDF = StructuredPDF()
 
+    def extract(self) -> StructuredPDF:
         self._from_content_to_data()
         asyncio.run(self._extract_text())
+        return self.data
 
-    def _from_content_to_data(self):
-        for entry in self.content:
+    def _from_content_to_data(self) -> None:
+        for entry in self.pdfcontent['content']:
             ids: list[int] = entry['id']
             title: str = entry['title']
             page: int = entry['page']
 
             self.data.set(ids, title = title, page = page)
 
-    async def _extract_text(self):
+    async def _retry_entry(self, idss: list[list[int]]) -> None:
         tasks = []
         tasks_ids = []
-        for entry in self.content:
-            ids: list[int] = entry['id']
+        for ids in idss:
             next_ids: list[int] = self.data.next(ids)
 
             this_page: int = self.data[ids]['page']
@@ -589,11 +653,11 @@ class PDF:
             else:
                 # TODO
                 next_page: int = self.data[ids]['page'] + 10
-                right_title = '前一个标题的最末尾'
+                right_title = None
 
 
             tasks.append(_extract_one_section(
-                pages_dir = self.pages_dir,
+                pngs = self.pngs,
                 left_page = this_page + self.p1_page - 1,
                 right_page = next_page + self.p1_page - 1,
                 left_title = self.data[ids]['title'],
@@ -609,41 +673,134 @@ class PDF:
         for i in range(len(results)):
             self.data[tasks_ids[i]]['text'] = results[i]
 
-def _export_pdf(pdf: PDF) -> str:
-    return json.dumps(pdf.data.data, indent = 4, ensure_ascii = False)
 
-# TODO
-def _load_json_to_pdf(jsonpath: str | Path) -> PDF:
-    with open(jsonpath, 'wt', encoding = 'utf-8') as f:
-        pass
+    async def _extract_text(self) -> None:
+        tasks = []
+        tasks_ids = []
+        for entry in self.pdfcontent['content']:
+            ids: list[int] = entry['id']
+            next_ids: list[int] = self.data.next(ids)
 
-def extract():
+            this_page: int = self.data[ids]['page']
+
+            if next_ids:
+                next_page: int = self.data[next_ids]['page']
+                right_title = self.data[next_ids]['title']
+            else:
+                # TODO
+                next_page: int = self.data[ids]['page'] + 10
+                right_title = None
+
+
+            tasks.append(_extract_one_section(
+                pngs = self.pngs,
+                left_page = this_page + self.p1_page - 1,
+                right_page = next_page + self.p1_page - 1,
+                left_title = self.data[ids]['title'],
+                right_title = right_title
+            ))
+            tasks_ids.append(ids)
+
+        simpidlog.info(_LOG_PREFIX + f'_extract_text(): 提取内容中...')
+        results = await asyncio.gather(*tasks)
+        simpidlog.info(_LOG_PREFIX + f'_extract_text(): 内容提取完毕！')
+
+        assert len(results) == len(tasks) == len(tasks_ids)
+        for i in range(len(results)):
+            self.data[tasks_ids[i]]['text'] = results[i]
+
+def extract_handler() -> None:
     pdfpath: Path = Path(args.target)
     outdir: Path = Path(args.output)
 
-    pdfcontent = PDFContent(pdfpath = pdfpath)
-    with open(outdir / (pdfpath.stem + '.content.pkl'), 'wb') as f:
-        pickle.dump(pdfcontent, f)
+    pngs: PDFPNG = PDFPNG()
+    pngs.from_pdf(pdfpath = pdfpath)
 
-    pdf = PDF(pdfcontent, int(input('p1_page: ')))
-    with open(outdir / (pdfpath.stem + '.pkl'), 'wb') as f:
-        pickle.dump(pdf, f)
+    if args.restore is None:
+        left, right = asyncio.run(_search_for_content_range(pngs))
+        pdfcontent: PDFContent = asyncio.run(_extract_content(pngs, left, right))
+        with open(outdir / (pdfpath.stem + '.content.json'), 'wt', encoding = 'utf-8') as f:
+            f.write(json.dumps(pdfcontent, indent = 4, ensure_ascii = False))
+        simpidlog.info(_LOG_PREFIX + f'请查看：{str(outdir / (pdfpath.stem + '.content.json'))}')
+        input('Continue?')
 
-def export():
-    pklpath: Path = Path(args.target)
-
-    if args.output is None:
-        outdir: Path = pklpath.resolve().parent
+        pdfextractor = PDFExtractor(pdfcontent, pngs, int(input('p1_page: ')))
+        with open(outdir / (pdfpath.stem + '.pkl'), 'wb') as f:
+            pickle.dump(pdfextractor, f)
     else:
-        outdir: Path = Path(args.output)
+        with open(args.restore, 'rb') as f:
+            pdfextractor = pickle.load(f)
 
+    input('Begin extract?')
+    with open(outdir / (pdfpath.stem + '.json'), 'wt', encoding = 'utf-8') as f:
+        f.write(json.dumps(pdfextractor.extract().data, indent = 4, ensure_ascii = False))
+    with open(outdir / (pdfpath.stem + '.pkl'), 'wb') as f:
+        pickle.dump(pdfextractor, f)
+    simpidlog.info('Done.')
+
+def _print_content_of_pdf(pdf: StructuredPDF):
+    def _layer_print(level: int, layer: list[dict]):
+        for entry in layer:
+            print(' ' * 4 * level + f'{entry['id']}: {entry['title']} ({len(entry['text'])})')
+            if len(entry['childs']) > 0:
+                _layer_print(level + 1, entry['childs'])
+    _layer_print(0, pdf.data)
+
+
+def print_handler():
+    jsonpath: Path = Path(args.target)
+    pdf: StructuredPDF = StructuredPDF()
+    pdf.from_json(jsonpath)
+
+    _print_content_of_pdf(pdf)
+
+
+def retry_handler():
+    pklpath: Path = Path(args.target)
+    outdir: Path = Path(args.output)
     with open(pklpath, 'rb') as f:
-        pdf: PDF = pickle.load(f)
+        pdfextractor: PDFExtractor = pickle.load(f)
+
+    idss: list[list[int]] = []
+    while True:
+        retry_ids = input('Which entry you want to retry? Input: \n')
+        if retry_ids == 'ok': break
+        idss.append([int(each) for each in retry_ids.split('.')])
+
+    asyncio.run(pdfextractor._retry_entry(idss))
 
     with open(outdir / (pklpath.stem + '.json'), 'wt', encoding = 'utf-8') as f:
-        f.write(_export_pdf(pdf))
+        f.write(json.dumps(pdfextractor.data.data, indent = 4, ensure_ascii = False))
+    with open(outdir / (pklpath.stem + '.pkl'), 'wb') as f:
+        pickle.dump(pdfextractor, f)
+    simpidlog.info('Done.')
 
-    simpidlog.info(_LOG_PREFIX + f'Success: {pklpath} --export--> {outdir / (pklpath.stem + '.json')}')
+def export_handler() -> None:
+    jsonpath: Path = Path(args.target)
+    outdir: Path = Path(args.output)
+
+    pdf: StructuredPDF = StructuredPDF()
+    pdf.from_json(jsonpath = jsonpath)
+
+    id_stack: list[int] = []
+    def layer_iterator(id_stack: list[int], outdir: Path, pdf: list[dict]):
+        for entry in pdf:
+            id: int = entry['id']
+            title: str = entry['title']
+            text: str = entry['text']
+            childs: list[dict] = entry['childs']
+
+            id_stack.append(id)
+
+            if len(text) > 1:
+                with open(outdir / f'{'.'.join(list(map(str, id_stack)))}_{title}.md', 'wt', encoding = 'utf-8') as f:
+                    f.write(text)
+            if childs:
+                layer_iterator(id_stack, outdir, childs)
+            id_stack.pop(-1)
+
+    layer_iterator([], outdir, pdf.data)
+
 
 
 def main():
@@ -651,12 +808,19 @@ def main():
 
     match cmd:
         case 'extract':
-            extract()
+            extract_handler()
+        case 'print':
+            print_handler()
+        case 'retry':
+            retry_handler()
         case 'export':
-            export()
+            export_handler()
+
 
 if __name__ == '__main__':
     simpidlog.set_basedir(args.logdir)
+    simpidlog.set_whether_synchronous(True)
+    simpidlog.start()
 
     try:
         main()

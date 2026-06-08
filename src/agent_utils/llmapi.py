@@ -3,8 +3,12 @@ import re
 import json
 import base64
 import typing
+import uuid
 from magic import from_buffer as analyse_mime_from_bin
 import mimetypes
+import httpx
+
+import traceback
 
 from typing import Annotated, Literal
 from markdown import markdown
@@ -14,6 +18,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from openai import OpenAIError
+from openai import AsyncStream
 
 import simpidlog
 
@@ -45,6 +50,51 @@ class FileSizeExceededError(Exception):
     def __init__(self, *args: object) -> None:
         super().__init__(*args)
 
+class LLMResponseTypeError(Exception):
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+def _extract_text_from_raw_sse(raw: str) -> str:
+    chunks: list[str] = []
+
+    for block in raw.split("\n\n"):
+        data_lines = []
+        for line in block.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+
+        if not data_lines:
+            continue
+
+        data = "\n".join(data_lines)
+        if data == "[DONE]":
+            continue
+
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        typ = payload.get("type")
+
+        if typ == "response.output_text.delta":
+            chunks.append(payload.get("delta", ""))
+
+        elif typ == "response.output_text.done":
+            # 有些实现会在 done 里带完整 text
+            text = payload.get("text")
+            if text and not chunks:
+                chunks.append(text)
+
+        elif typ in ("response.completed", "response.done"):
+            # 兜底：从最终 response.output 里抽文本
+            resp = payload.get("response") or {}
+            for item in resp.get("output", []):
+                for c in item.get("content", []):
+                    if c.get("type") in ("output_text", "text"):
+                        chunks.append(c.get("text", ""))
+
+    return "".join(chunks).strip()
 
 class OnlineLLM:
     DEFAULT_MIME = 'application/octet-stream'
@@ -72,7 +122,7 @@ class OnlineLLM:
         if missing:
             names = ", ".join(missing)
             errmsg = simpidlog.error(
-                _ERROR_PREFIX +
+                _ERROR_PREFIX + 'OnlineLLM.__init__(): ' +
                 f'Lacking LLM API config: {names}. Please config at `.env`, for instance,\n'
                 '    BASEURL=\"https://api.openai.com/v1\"\n'
                 '    APIKEY=\"sk-...\"\n'
@@ -82,11 +132,20 @@ class OnlineLLM:
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg)
 
-        self.client: AsyncOpenAI = client if client is not None else AsyncOpenAI(api_key = self.api_key, base_url = self.base_url)
+        self.client: AsyncOpenAI = \
+            client if client is not None else \
+            AsyncOpenAI(api_key = self.api_key, base_url = self.base_url, timeout = httpx.Timeout(
+                connect = 60.0,
+                read = 1200.0,
+                write = 600.0,
+                pool = 60.0
+            ))
 
     def _raise_if_file_size_exceeded(self, total_size: int) -> None:
         if total_size > FileSizeExceededError.MAX_SIZE:
-            errmsg = _ERROR_PREFIX + f'Files total size: {(total_size / 1024) / 1024} MB, exceeded {(FileSizeExceededError.MAX_SIZE / 1024) / 1024} MB.'
+            errmsg = _ERROR_PREFIX + 'OnlineLLM._raise_if_file_size_exceeded(): ' + \
+                     f'Files total size: {(total_size / 1024) / 1024} MB, ' + \
+                     f'exceeded {(FileSizeExceededError.MAX_SIZE / 1024) / 1024} MB.'
             simpidlog.error(errmsg)
             raise FileSizeExceededError(errmsg)
 
@@ -168,7 +227,9 @@ class OnlineLLM:
         )
 
         if total_size > FileSizeExceededError.MAX_SIZE:
-            errmsg = _ERROR_PREFIX + f'Files total size: {(total_size / 1024) / 1024} MB, exceeded {(FileSizeExceededError.MAX_SIZE / 1024) / 1024} MB.'
+            errmsg = _ERROR_PREFIX + 'OnlineLLM._insert_bins_to_messages_compatible(): ' + \
+                     f'Files total size: {(total_size / 1024) / 1024} MB, ' + \
+                     f'exceeded {(FileSizeExceededError.MAX_SIZE / 1024) / 1024} MB.'
             simpidlog.error(errmsg)
             raise FileSizeExceededError(errmsg)
 
@@ -256,14 +317,32 @@ class OnlineLLM:
         )
 
         return messages
+ 
+    async def _parse_stream_response(self, stream: AsyncStream, request_id: str) -> str:
+        text: str = ''
+        index: int = 0
+        async for event in stream:
+            match event.type:
+                case 'response.output_text.delta':
+                    text += event.delta
+                    index += 1
+                    simpidlog.debug(f'[{event.delta}]')
+            if index % 1000 == 0 and index != 0:
+                simpidlog.debug(_ERROR_PREFIX + f'OnlineLLM._parse_stream_response(): {request_id} has got {index} deltas...')
+        simpidlog.debug(_ERROR_PREFIX + f'OnlineLLM._parse_stream_response(): ' + \
+                        f'{request_id} done with {index} deltas, {len(text)} bytes.\n' + \
+                        f'{text[:100]}...')
+        return text
 
     async def call_compatible(
         self,
         system_prompt: str | None,
         user_prompt: str,
         temperature: float,
+        effort: Literal['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
         file_paths: _FILE_PATHS_ANNOTATION = None,
         file_bins: _FILE_BINS_ANNOTATION = None,
+        stream: bool = False
      ) -> str:
         assert self.model_id is not None
         messages = self._build_msgs_compatible(
@@ -274,23 +353,34 @@ class OnlineLLM:
         )
 
         try:
+            request_id: str = str(uuid.uuid4())
             response = await self.client.chat.completions.create(
                 model = self.model_id,
                 temperature = temperature,
-                messages = messages
+                messages = messages,
+                stream = stream,
+                reasoning_effort = effort
             )
         except OpenAIError as exc:
-            errmsg = _ERROR_PREFIX + 'Failed to call LLM API.'
+            traceback.print_exc()
+            errmsg = _ERROR_PREFIX + 'OnlineLLM.call_compatible(): Failed to call LLM API.\n' + str(exc)
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
+            print(str(exc))
             raise RuntimeError(errmsg) from exc
 
-        if isinstance(response, str):
-            content = response
+        if stream:
+            assert(isinstance(response, AsyncStream))
+            content = await self._parse_stream_response(stream = response, request_id = request_id)
         else:
-            content = response.choices[0].message.content
+            if isinstance(response, str):
+                content = response
+            else:
+                content = response.choices[0].message.content
+
+
         if not content:
-            errmsg = _ERROR_PREFIX + 'LLM API calling returned empty content.'
+            errmsg = _ERROR_PREFIX + 'OnlineLLM.call_compatible(): LLM API calling returned empty content.'
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg)
@@ -311,7 +401,9 @@ class OnlineLLM:
         )
 
         if total_size > FileSizeExceededError.MAX_SIZE:
-            errmsg = _ERROR_PREFIX + f'Files total size: {(total_size / 1024) / 1024} MB, exceeded {(FileSizeExceededError.MAX_SIZE / 1024) / 1024} MB.'
+            errmsg = _ERROR_PREFIX + 'OnlineLLM._insert_bins_to_messages_responses(): ' + \
+                     f'Files total size: {(total_size / 1024) / 1024} MB, ' + \
+                     f'exceeded {(FileSizeExceededError.MAX_SIZE / 1024) / 1024} MB.'
             simpidlog.error(errmsg)
             raise FileSizeExceededError(errmsg)
 
@@ -366,10 +458,12 @@ class OnlineLLM:
         system_prompt: str | None,
         user_prompt: str,
         temperature: float,
+        effort: Literal['none', 'low', 'medium', 'high', 'xhigh'] = 'medium',
         web_search: Literal['none', 'low', 'medium', 'high'] = 'none',
         tools_required: bool = False,
         file_paths: _FILE_PATHS_ANNOTATION = None,
         file_bins: _FILE_BINS_ANNOTATION = None,
+        stream: bool = False
      ) -> str:
         assert self.model_id is not None
         messages = self._build_msgs_responses(
@@ -380,17 +474,22 @@ class OnlineLLM:
         )
 
         try:
+            request_id: str = str(uuid.uuid4())
             if web_search == 'none':
                 response = await self.client.responses.create(
                     model = self.model_id,
                     temperature = temperature,
                     input = messages,
+                    stream = stream,
+                    reasoning = { 'effort': effort },
                 )
             else:
                 response = await self.client.responses.create(
                     model = self.model_id,
                     temperature = temperature,
                     input = messages,
+                    stream = stream,
+                    reasoning = { 'effort': effort },
                     tools = [{
                         'type': 'web_search',
                         'search_context_size': web_search
@@ -398,16 +497,29 @@ class OnlineLLM:
                     tool_choice = 'required' if tools_required else 'auto'
                 )
 
+
         except OpenAIError as exc:
-            errmsg = _ERROR_PREFIX + 'Failed to call LLM API.'
+            traceback.print_exc()
+            errmsg = _ERROR_PREFIX + 'OnlineLLM.call_responses(): Failed to call LLM API.\n' + str(exc)
             simpidlog.error(errmsg)
             simpidlog.wait_for_log_io()
             raise RuntimeError(errmsg) from exc
 
-        if isinstance(response, str):
-            content = response
+        if stream:
+            assert(isinstance(response, AsyncStream))
+            content = await self._parse_stream_response(stream = response, request_id = request_id)
         else:
-            content = response.output_text
+            if isinstance(response, str):
+                '''
+                errmsg = _ERROR_PREFIX + f'OnlineLLM.call_responses(): The type of response is str.'
+                simpidlog.error(errmsg)
+                simpidlog.error(_ERROR_PREFIX + response)
+                raise LLMResponseTypeError(errmsg)
+                '''
+                content = _extract_text_from_raw_sse(response)
+            else:
+                content = response.output_text
+
         if not content:
             errmsg = _ERROR_PREFIX + 'LLM API calling returned empty content.'
             simpidlog.error(errmsg)
@@ -463,3 +575,15 @@ class OnlineLLM:
         for code in codes:
             results.append(code.text)
         return results
+
+
+if __name__ == '__main__':
+    llm = OnlineLLM()
+
+    import asyncio
+    res = asyncio.run(llm.call_responses(
+        system_prompt = None,
+        user_prompt = 'How are you?',
+        temperature = 0.0
+    ))
+    print(res)

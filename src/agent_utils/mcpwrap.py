@@ -84,6 +84,8 @@ from mcp import ClientSession, StdioServerParameters, types as mcp_types
 from mcp.client.stdio import stdio_client
 from mcp.shared.session import ProgressFnT
 
+import simpidlog
+
 
 StdioMCPConfig = Mapping[str, Any] | StdioServerParameters
 
@@ -194,7 +196,7 @@ class StdioMCPSession:
     ) -> mcp_types.ListToolsResult:
         session = self.session
         return await self._call_with_timeout(
-            lambda: session.list_tools(cursor=cursor, params=params),
+            lambda: session.list_tools(cursor = cursor, params =params),
             timeout,
         )
 
@@ -222,17 +224,20 @@ class StdioMCPSession:
         if timeout is None:
             return await make_awaitable()
         self._validate_timeout(timeout)
-        return await asyncio.wait_for(make_awaitable(), timeout=timeout)
+        return await asyncio.wait_for(make_awaitable(), timeout = timeout)
 
     def _timeout_delta(self, timeout: float | None) -> timedelta | None:
         if timeout is None:
             return None
         self._validate_timeout(timeout)
-        return timedelta(seconds=timeout)
+        return timedelta(seconds = timeout)
 
     def _validate_timeout(self, timeout: float) -> None:
         if timeout < 0 or not isfinite(timeout):
-            raise ValueError("timeout must be a finite non-negative number or None.")
+            errmsg = "timeout must be a finite non-negative number or None."
+            simpidlog.error(errmsg)
+            simpidlog.wait_for_log_io()
+            raise ValueError(errmsg)
 
 
 async def call_stdio_tool(
@@ -247,13 +252,13 @@ async def call_stdio_tool(
 ) -> mcp_types.CallToolResult:
     """Open a stdio MCP server, call one tool, then close it."""
 
-    async with StdioMCPSession(config, initialize_timeout=initialize_timeout) as session:
+    async with StdioMCPSession(config, initialize_timeout = initialize_timeout) as session:
         return await session.call_tool(
             name,
             arguments,
-            timeout=timeout,
-            progress_callback=progress_callback,
-            meta=meta,
+            timeout = timeout,
+            progress_callback = progress_callback,
+            meta = meta,
         )
 
 
