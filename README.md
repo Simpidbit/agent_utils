@@ -1,6 +1,6 @@
 # agent_utils
 
-`agent_utils` 是一组面向 AI Agent 开发的 Python 实用工具。它目前主要覆盖三类高频需求：调用 OpenAI / OpenAI-compatible LLM API、通过视觉模型把 PDF 分段转成结构化 Markdown、以及用更安全的生命周期包装 stdio MCP server。
+`agent_utils` 是一组面向 AI Agent 开发的 Python 实用工具。它目前主要覆盖四类高频需求：调用 OpenAI / OpenAI-compatible LLM API、通过视觉模型把 PDF 分段转成结构化 Markdown、用更安全的生命周期包装 stdio MCP server，以及把“AI 味”中文技术文本改写成更自然的教学风格。
 
 这个项目不是一个大而全的 Agent 框架，而是把实际项目中经常重复写、容易写错的底层能力沉淀成可复用模块。
 
@@ -13,6 +13,7 @@
 - 输出解析：提供 JSON 对象解析、Markdown fenced code block 提取工具。
 - `StdioMCPSession`：stdio MCP server 的异步生命周期封装，避免手动管理初始化、超时和关闭。
 - `pdf2markdown`：把 PDF 渲染成 PNG 后调用视觉模型，自动识别目录、分节提取内容，并导出 Markdown。
+- `deai`：调用 Responses API，把中文技术文本改写成更自然、循序渐进、适合初学者阅读的讲解风格。
 
 ## 适用场景
 
@@ -21,6 +22,7 @@
 - 你需要处理模型返回的 JSON 或 Markdown 代码块。
 - 你需要在 Python 里调用 stdio MCP server，并希望调用结束后可靠释放资源。
 - 你需要把教材、论文、书籍类 PDF 拆成适合 LLM 阅读的 Markdown 片段。
+- 你需要把明显的 AI 生成技术文本改写成更像人工讲解、但仍保持技术准确性的中文内容。
 
 ## 安装
 
@@ -86,7 +88,7 @@ OPENAI_API_KEY="sk-..."
 OPENAI_MODEL="gpt-4.1"
 ```
 
-源码会读取 `src/agent_utils/.env`，也可以直接使用当前 shell 的环境变量。`.env`、`.env.*` 已在 `.gitignore` 中忽略，不应提交密钥。
+源码会读取 `src/agent_utils/.env`，也可以直接使用当前 shell 的环境变量。`.env`、`.env.*` 已在 `.gitignore` 中忽略，不应提交密钥。`OnlineLLM`、`pdf2markdown` 和 `deai` 都复用这组 LLM 配置。
 
 ## 快速开始
 
@@ -350,6 +352,52 @@ print("hello")
 ```
 ````
 
+## deai 文本改写
+
+`agent_utils.deai` 提供一个面向中文技术文本的改写工具，用来把明显的 AI 生成风格改成更自然、循序渐进、适合初学者理解的讲解风格。它不会做本地规则替换，而是复用 `OnlineLLM.call_responses(...)` 调用模型。
+
+Python API：
+
+```python
+import asyncio
+
+from agent_utils.deai import deai
+
+
+async def main() -> None:
+    rewritten = await deai(
+        "这是一段需要改写的中文技术文本。",
+        temperature=0.7,
+        effort="xhigh",
+        stream=False,
+    )
+    print(rewritten)
+
+
+asyncio.run(main())
+```
+
+命令行用法：
+
+```bash
+python -m agent_utils.deai "这是一段需要改写的中文技术文本。"
+python -m agent_utils.deai --input input.md --output output.md --effort high
+python -m agent_utils.deai --stream < input.md
+```
+
+参数说明：
+
+| 参数 | 说明 |
+| --- | --- |
+| `text` | 直接传入待改写文本；如果省略，则从 stdin 读取。 |
+| `--input` | 从文件读取待改写文本；不能和位置参数 `text` 同时使用。 |
+| `--output` | 写入输出文件；省略时输出到 stdout。 |
+| `--temperature` | 传给模型的 temperature，CLI 默认 `0.7`。 |
+| `--effort` | Responses API reasoning effort，CLI 默认 `medium`。 |
+| `--stream` | 使用流式请求接收模型输出；最终仍然一次性写出完整文本。 |
+
+注意：`deai(...)` 的 Python API 默认 `effort="xhigh"`，而 CLI 默认 `--effort medium`；如果命令行也需要更强推理，可以显式传入 `--effort xhigh`。
+
 ## MCP stdio 封装
 
 `agent_utils.mcpwrap` 提供 `StdioMCPSession` 和 `call_stdio_tool`，用于调用 stdio MCP server。
@@ -376,6 +424,30 @@ async def main() -> None:
             timeout=60,
         )
         print(result)
+
+
+asyncio.run(main())
+```
+
+如果不方便使用 `async with`，也可以手动打开和关闭 session：
+
+```python
+import asyncio
+
+from agent_utils.mcpwrap import StdioMCPSession
+
+
+async def main() -> None:
+    mcp = StdioMCPSession({"command": "python", "args": ["server.py"]})
+    await mcp.open()
+
+    try:
+        print(mcp.is_open)
+        print(mcp.initialize_result.serverInfo)
+        result = await mcp.call_tool("tool_name", {"key": "value"}, timeout=60)
+        print(result)
+    finally:
+        await mcp.aclose()
 
 
 asyncio.run(main())
@@ -523,7 +595,7 @@ python -m agent_utils.pdf2markdown export ./output/book/book.json --output ./out
 当前主要测试集中在 `llmapi.py`：
 
 ```bash
-python -m py_compile src/agent_utils/llmapi.py src/agent_utils/test.llmapi.py/main.py
+python -m py_compile src/agent_utils/llmapi.py src/agent_utils/mcpwrap.py src/agent_utils/deai.py src/agent_utils/test.llmapi.py/main.py
 python src/agent_utils/test.llmapi.py/main.py
 ```
 
@@ -532,6 +604,8 @@ python src/agent_utils/test.llmapi.py/main.py
 ```bash
 python src/agent_utils/test.llmapi.py/main.py FileEncodingTests CompatibleMessageTests ResponsesMessageTests
 ```
+
+`src/agent_utils/test_llmapi.py` 是直接连接本地 OpenAI-compatible 网关的手动 smoke script，不属于离线 unittest；运行前需要自行确认其中的 base URL、API key 和模型配置。如需临时改动，请不要提交真实密钥。
 
 如果修改 README 或 Markdown 内容，可以额外检查 diff 中是否有多余空白：
 
@@ -565,9 +639,11 @@ agent_utils/
 | `src/agent_utils/llmapi.py` | LLM API 封装、图片上传、流式响应解析、JSON/代码块解析。 |
 | `src/agent_utils/mcpwrap.py` | stdio MCP server 的异步 session 封装。 |
 | `src/agent_utils/pdf2markdown.py` | PDF 渲染、目录识别、分节提取、Markdown 导出工具。 |
+| `src/agent_utils/deai.py` | 中文技术文本去 AI 味改写工具，提供 Python API 和 `python -m agent_utils.deai` CLI。 |
 | `src/agent_utils/__init__.py` | 导出 `OnlineLLM` 和 `StdioMCPSession`。 |
 | `src/agent_utils/test.llmapi.py/main.py` | `llmapi.py` 的主要 unittest 测试。 |
-| `src/agent_utils/deai.py` | 早期草稿代码，当前不建议作为稳定 API 使用。 |
+| `src/agent_utils/test_llmapi.py` | 需要真实模型网关的手动 stream smoke script。 |
+| `src/agent_utils/test.py` | 本地临时 smoke script，已在 `.gitignore` 中忽略。 |
 
 ## 开发说明
 
@@ -576,6 +652,7 @@ agent_utils/
 - 对 LLM 返回内容，日志里尽量不要记录完整正文，避免泄露敏感数据。
 - 对上传文件，当前策略是 image-only；不要重新引入通用 file payload，除非上层有明确需求并补齐测试。
 - 修改 `llmapi.py` 后，至少运行完整 `src/agent_utils/test.llmapi.py/main.py`。
+- 修改 `mcpwrap.py` 或 `deai.py` 后，至少运行 README 测试章节中的 `py_compile` 命令。
 
 ## License
 
