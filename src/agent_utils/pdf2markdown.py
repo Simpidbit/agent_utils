@@ -538,7 +538,8 @@ class StructuredPDF:
     @typechecked
     def from_json(self, jsonpath: str | Path) -> None:
         jsonpath = Path(jsonpath)
-        self.data = json.loads(jsonpath.read_text(encoding = 'utf-8'))
+        with open(jsonpath, 'rt', encoding = 'utf-8') as f:
+            self.data = json.loads(f.read())
 
 @typechecked
 async def _extract_one_section(
@@ -560,7 +561,7 @@ async def _extract_one_section(
 
     for i in range(MAX_TRY):
         try:
-            llm_response = await llm.call_responses(
+            llm_response = await llm.call_compatible(
                 system_prompt = 
 '''## 背景介绍
 用户会上传若干张 PNG 图片给你，这若干张 PNG 图片其实是一个 PDF 文件当中的连续的几页渲染成 PNG 图片的结果。
@@ -782,8 +783,9 @@ def export_handler() -> None:
     pdf: StructuredPDF = StructuredPDF()
     pdf.from_json(jsonpath = jsonpath)
 
+
     id_stack: list[int] = []
-    def layer_iterator(id_stack: list[int], outdir: Path, pdf: list[dict]):
+    def layer_iterator(id_stack: list[int], outdir: Path, pdf: list[dict], all_text: list[str]):
         for entry in pdf:
             id: int = entry['id']
             title: str = entry['title']
@@ -795,11 +797,16 @@ def export_handler() -> None:
             if len(text) > 1:
                 with open(outdir / f'{'.'.join(list(map(str, id_stack)))}_{title}.md', 'wt', encoding = 'utf-8') as f:
                     f.write(text)
+                all_text.append(text)
             if childs:
-                layer_iterator(id_stack, outdir, childs)
+                layer_iterator(id_stack, outdir, childs, all_text)
             id_stack.pop(-1)
 
-    layer_iterator([], outdir, pdf.data)
+    all_text: list[str] = []
+    layer_iterator([], outdir, pdf.data, all_text)
+
+    with open(outdir / (str(Path(args.target).stem) + '.txt'), 'wt', encoding = 'utf-8') as f:
+        f.write('\n'.join(all_text))
 
 
 
