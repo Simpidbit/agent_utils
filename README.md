@@ -517,6 +517,7 @@ python -m agent_utils.pdf2markdown <cmd> <target> --output <output-dir> [options
 | `--output` | 无 | 输出目录。当前代码假设目录已存在。 |
 | `--workers` | `20` | PDF 渲染为 PNG 时使用的进程数。 |
 | `--dpi` | `144` | PDF 页面渲染 DPI。 |
+| `--max-concurrent-requests` | `5` | `extract` 时同时进行的 LLM 请求数上限，超过后排队等待。 |
 | `--logdir` | `/tmp/agent_utils/pdf2markdown` | simpidlog 日志目录。 |
 | `--restore` | 无 | `extract` 时从已有 `.pkl` 恢复。 |
 
@@ -575,7 +576,7 @@ python -m agent_utils.pdf2markdown export ./output/book/book.json --output ./out
 - 目录识别和内容提取依赖模型能力，复杂排版、扫描质量差、目录页不规范时可能需要人工修正或重试。
 - 上传图片总大小受 `OnlineLLM` 的 50 MiB 限制影响；页数过多或 DPI 过高时可能失败。
 - `--dpi` 越高，OCR/视觉效果可能越好，但图片更大、成本更高、速度更慢。
-- 当前实现会并发提取多个章节，请注意模型网关的速率限制。
+- 当前实现会并发提取多个章节；可用 `--max-concurrent-requests` 控制同时进行的 LLM 请求数，避免触发模型网关的速率限制。
 
 ## 异常与日志
 
